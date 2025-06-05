@@ -1,83 +1,103 @@
 import numpy as np
+from PIL import Image
+import os
+import matplotlib.pyplot as plt
+import heapq
+import cv2
 
 
-def manual_color_segmentation(image_np, hue_range=(10, 30), sat_thresh=50):
-    """基於HSV色彩空間的手動閾值分割"""
-    # 轉換RGB到HSV（自主實現，避免使用cv2.cvtColor）
-    r, g, b = image_np[:, :, 0], image_np[:, :, 1], image_np[:, :, 2]
-    maxc = np.max(image_np, axis=2)
-    minc = np.min(image_np, axis=2)
-    diff = maxc - minc + 1e-10
-
-    # 計算色調(Hue)
-    h = np.zeros_like(maxc)
-    mask = maxc == r
-    h[mask] = (60 * ((g[mask] - b[mask]) / diff[mask]) + 360) % 360
-    mask = maxc == g
-    h[mask] = (60 * ((b[mask] - r[mask]) / diff[mask]) + 120) % 360
-    mask = maxc == b
-    h[mask] = (60 * ((r[mask] - g[mask]) / diff[mask]) + 240) % 360
-
-    # 計算飽和度(Saturation)
-    s = (diff / (maxc + 1e-10)) * 255
-
-    # 手動閾值處理
-    mask = (h >= hue_range[0]) & (h <= hue_range[1]) & (s > sat_thresh)
-    return mask.astype(np.uint8)
+def compute_gradient(gray):
+    # 計算簡單的梯度（邊緣強度）
+    gx = np.zeros_like(gray)
+    gy = np.zeros_like(gray)
+    gx[:, 1:-1] = gray[:, 2:] - gray[:, :-2]
+    gy[1:-1, :] = gray[2:, :] - gray[:-2, :]
+    grad = np.hypot(gx, gy)
+    grad = (grad / grad.max() * 255).astype(np.uint8)
+    return grad
 
 
-def morphological_cleanup(mask):
-    """自主實現形態學操作"""
-    # 自定義卷積核
-    kernel = np.array([[0, 1, 0], [1, 1, 1], [0, 1, 0]], dtype=np.uint8)
-
-    # 膨脹操作
-    dilated = np.zeros_like(mask)
-    h, w = mask.shape
-    for i in range(1, h - 1):
-        for j in range(1, w - 1):
-            if np.any(mask[i - 1 : i + 2, j - 1 : j + 2] * kernel):
-                dilated[i, j] = 1
-
-    # 腐蝕操作
-    eroded = np.zeros_like(dilated)
-    for i in range(1, h - 1):
-        for j in range(1, w - 1):
-            if np.all(dilated[i - 1 : i + 2, j - 1 : j + 2] >= kernel):
-                eroded[i, j] = 1
-    return eroded
+def get_markers(gray, thresh_fg=0.7, thresh_bg=0.2):
+    # 前景標記：亮區，背景標記：暗區
+    markers = np.zeros_like(gray, dtype=np.int32)
+    fg = gray > (gray.max() * thresh_fg)
+    bg = gray < (gray.max() * thresh_bg)
+    markers[bg] = 1  # 背景
+    markers[fg] = 2  # 前景
+    return markers
 
 
-def find_mango_contour(mask):
-    """基於邊緣追蹤的輪廓檢測"""
-    contours = []
-    visited = np.zeros_like(mask, dtype=bool)
-    h, w = mask.shape
+def watershed(img_path):
+    # 1. 讀取圖像，轉灰階
+    img = cv2.imread(img_path)
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-    for i in range(h):
-        for j in range(w):
-            if mask[i, j] == 1 and not visited[i, j]:
-                # 區域生長法找輪廓
-                queue = [(i, j)]
-                current_contour = []
-                while queue:
-                    x, y = queue.pop(0)
-                    if (
-                        0 <= x < h
-                        and 0 <= y < w
-                        and not visited[x, y]
-                        and mask[x, y] == 1
-                    ):
-                        visited[x, y] = True
-                        current_contour.append((y, x))  # (x,y)轉換為圖片座標
-                        # 8鄰域搜索
-                        queue.extend(
-                            [(x + dx, y + dy) for dx in (-1, 0, 1) for dy in (-1, 0, 1)]
-                        )
-                contours.append(np.array(current_contour))
+    # 2. 二值化
+    _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
 
-    # 選取最大面積輪廓
-    if contours:
-        largest = max(contours, key=lambda x: x.shape[0])
-        return largest
-    return None
+    # 3. 形態學開運算去雜訊
+    kernel = np.ones((3, 3), np.uint8)
+    opening = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel, iterations=2)
+
+    # 4. 膨脹得到「確定背景」
+    sure_bg = cv2.dilate(opening, kernel, iterations=3)
+
+    # 5. 距離轉換得到「確定前景」
+    dist_transform = cv2.distanceTransform(opening, cv2.DIST_L2, 5)
+    _, sure_fg = cv2.threshold(dist_transform, 0.7 * dist_transform.max(), 255, 0)
+    sure_fg = np.uint8(sure_fg)
+
+    # 6. 找到未知區域
+    unknown = cv2.subtract(sure_bg, sure_fg)
+
+    # 7. 連通元件標記
+    num_labels, markers = cv2.connectedComponents(sure_fg)
+    markers = markers + 1  # 保證背景不是0
+    markers[unknown == 255] = 0  # 未知區域設為0
+
+    # 8. 用區域生長模擬分水嶺分割
+    # 這裡以鄰近像素的標記進行擴展，直到所有未知區域被標記
+    h, w = markers.shape
+    changed = True
+    while changed:
+        changed = False
+        for y in range(1, h - 1):
+            for x in range(1, w - 1):
+                if markers[y, x] == 0:
+                    neighbor_labels = set()
+                    for dy in [-1, 0, 1]:
+                        for dx in [-1, 0, 1]:
+                            if dy == 0 and dx == 0:
+                                continue
+                            label = markers[y + dy, x + dx]
+                            if label > 1:
+                                neighbor_labels.add(label)
+                    if len(neighbor_labels) == 1:
+                        markers[y, x] = neighbor_labels.pop()
+                        changed = True
+                    elif len(neighbor_labels) > 1:
+                        markers[y, x] = -1  # 分水嶺邊界
+
+    # 9. 將分水嶺邊界標記在原圖
+    img[markers == -1] = [0, 0, 255]  # 紅色
+    return img
+
+
+def cropper_threshold(img_path):
+
+    img = cv2.imread(img_path)
+    img_np = np.array(Image.open(img_path).convert("RGB"))
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    # 2. 二值化
+    _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+
+    # 3. 形態學開運算去雜訊
+    kernel = np.ones((4, 4), np.uint8)
+    opening = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel, iterations=2)
+
+    # 4. 膨脹得到「確定背景」
+    mask = cv2.dilate(opening, kernel, iterations=3)
+
+    result = img_np
+    result[mask == 0] = 0
+    return result, mask
