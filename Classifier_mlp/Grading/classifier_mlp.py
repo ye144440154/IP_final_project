@@ -5,18 +5,20 @@ import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import PCA
+from torch.optim.lr_scheduler import StepLR
 
 # ========= 參數設定 ==========
 USE_GPU = torch.cuda.is_available()  # 若沒有GPU改成false
 DEVICE = torch.device("cuda" if USE_GPU else "cpu")
 BATCH_SIZE = 32
-EPOCHS = 50
-LEARNING_RATE = 0.005
+EPOCHS = 60
+LEARNING_RATE = 0.05
 # ============================
 
 # 載入與合併 CSV
 csv1 = pd.read_csv('Grading_features_1.csv')
-csv2 = pd.read_csv('Grading_features.csv')
+csv2 = pd.read_csv('Grading_features_modified.csv')
 csv2 = csv2.iloc[:, 3:] # 去掉前3欄
 df = pd.concat([csv1, csv2], axis=1)
 
@@ -24,7 +26,8 @@ df = pd.concat([csv1, csv2], axis=1)
 df = df.sample(frac=1, random_state=42).reset_index(drop=True)
 
 # 擷取特徵與標籤
-feature_columns = ['Hue_Mean', 'Hue_Std', 'Saturation_Mean', 'Aspect_Ratio', 'H_hist_bin_0', 'H_hist_bin_1', 'H_hist_bin_2', 'H_hist_bin_3', 'H_hist_bin_4', 'H_hist_bin_5', 'H_hist_bin_6', 'H_hist_bin_7', 'S_hist_bin_0', 'S_hist_bin_1', 'S_hist_bin_2', 'S_hist_bin_3', 'S_hist_bin_4', 'S_hist_bin_5', 'S_hist_bin_6', 'S_hist_bin_7', 'V_hist_bin_0', 'V_hist_bin_1', 'V_hist_bin_2', 'V_hist_bin_3', 'V_hist_bin_4', 'V_hist_bin_5', 'V_hist_bin_6', 'V_hist_bin_7', 'glcm_contrast', 'glcm_homogeneity', 'glcm_energy', 'glcm_correlation', 'area', 'perimeter', 'eccentricity', 'solidity', 'extent', 'major_axis_length', 'minor_axis_length', 'edge_density'] 
+feature_columns = ['Hue_Mean', 'Hue_Std', 'Saturation_Mean', 'Aspect_Ratio', 'H_hist_bin_0', 'H_hist_bin_1', 'H_hist_bin_2', 'H_hist_bin_3', 'H_hist_bin_4', 'H_hist_bin_5', 'H_hist_bin_6', 'H_hist_bin_7', 'S_hist_bin_0', 'S_hist_bin_1', 'S_hist_bin_2', 'S_hist_bin_3', 'S_hist_bin_4', 'S_hist_bin_5', 'S_hist_bin_6', 'S_hist_bin_7', 'V_hist_bin_0', 'V_hist_bin_1', 'V_hist_bin_2', 'V_hist_bin_3', 'V_hist_bin_4', 'V_hist_bin_5', 'V_hist_bin_6', 'V_hist_bin_7', 'glcm_contrast', 'glcm_homogeneity', 'glcm_energy', 'glcm_correlation', 'area', 'perimeter', 'eccentricity', 'solidity', 'extent', 'major_axis_length', 'minor_axis_length', 'edge_density', 'dark_pixels_ratio', 'dark_area_ratio'] 
+# feature_columns = ['Hue_Mean', 'Hue_Std', 'Saturation_Mean', 'Aspect_Ratio', 'H_hist_bin_0', 'H_hist_bin_1', 'H_hist_bin_2', 'H_hist_bin_3', 'H_hist_bin_4', 'H_hist_bin_5', 'H_hist_bin_6', 'H_hist_bin_7', 'S_hist_bin_0', 'S_hist_bin_1', 'S_hist_bin_2', 'S_hist_bin_3', 'S_hist_bin_4', 'S_hist_bin_5', 'S_hist_bin_6', 'S_hist_bin_7', 'V_hist_bin_0', 'V_hist_bin_1', 'V_hist_bin_2', 'V_hist_bin_3', 'V_hist_bin_4', 'V_hist_bin_5', 'V_hist_bin_6', 'V_hist_bin_7', 'glcm_contrast', 'glcm_homogeneity', 'glcm_energy', 'glcm_correlation', 'dark_pixels_ratio', 'dark_area_ratio']  
 X = df[feature_columns].values
 y = df['Label'].values
 df.to_csv('combined_output.csv', index=False)
@@ -32,6 +35,10 @@ df.to_csv('combined_output.csv', index=False)
 # 特徵標準化
 scaler = StandardScaler()
 X = scaler.fit_transform(X)
+
+# # PCA降維
+# pca = PCA(n_components=0.95)
+# X = pca.fit_transform(X)
 
 # 拆分訓練/測試集
 X_train, X_test, y_train, y_test, idx_train, idx_test = train_test_split(
@@ -66,10 +73,18 @@ class MLP(nn.Module):
         super(MLP, self).__init__()
         self.model = nn.Sequential(
             nn.Linear(input_size, 64),
+            nn.BatchNorm1d(64),
             nn.ReLU(),
-            nn.Linear(64, 32),
+            nn.Dropout(p=0.5),
+            nn.Linear(64, 128),
+            nn.BatchNorm1d(128),
             nn.ReLU(),
-            nn.Linear(32, num_classes)
+            nn.Dropout(p=0.5),
+            nn.Linear(128, 64),
+            nn.BatchNorm1d(64),
+            nn.ReLU(),
+            nn.Dropout(p=0.5),
+            nn.Linear(64, num_classes)
         )
 
     def forward(self, x):
@@ -82,7 +97,6 @@ model = MLP(input_dim, num_classes).to(DEVICE)
 # Loss & Optimizer
 criterion = nn.CrossEntropyLoss() # 用cross entropy loss處理多類別分類
 optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
-
 # 訓練迴圈
 def train():
     model.train()
@@ -133,7 +147,7 @@ def evaluate():
     df_test_result = pd.DataFrame(all_results)
     df_test_result["Folder"] = df_test["Folder"]
     df_test_result["Filename"] = df_test["Filename"]
-    df_test_result.to_csv("test_predictions.csv", index=False)
+    df_test_result.to_csv("test_predictions_mlp.csv", index=False)
     print("Saved prediction results to test_predictions.csv")
 
 # 主程式
